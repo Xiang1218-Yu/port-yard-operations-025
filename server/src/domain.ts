@@ -6,7 +6,7 @@ export type AppointmentStatus = 'booked' | 'checked-in' | 'completed' | 'cancell
 export interface Voyage { id: string; vessel: string; imo: string; service: string; eta: string; etd: string; status: 'approaching' | 'berthed' | 'loading' | 'departed'; berth: string; movesPlanned: number; movesDone: number; lateRisk: 'low' | 'medium' | 'high'; }
 export interface Container { id: string; voyageId: string; size: '20' | '40' | '45'; isoType: string; direction: 'import' | 'export' | 'transshipment'; status: ContainerStatus; weightT: number; reefer: boolean; temperature?: number; hazmatClass?: string; customs: 'released' | 'inspection' | 'hold'; priority: 'normal' | 'hot' | 'reefer' | 'hazmat'; yardSlot: string; appointmentId?: string; lastEvent: string; }
 export interface YardBlock { id: string; zone: string; rows: number; tiers: number; capacity: number; occupied: number; reeferPlugs: number; usedPlugs: number; hazmatAllowed: boolean; equipment: EquipmentKind[]; heat: number; }
-export interface GateAppointment { id: string; containerId: string; truckNo: string; driver: string; type: 'pickup' | 'dropoff'; windowStart: string; windowEnd: string; lane: 'north' | 'south' | 'rail'; status: AppointmentStatus; sealVerified: boolean; weightVerified: boolean; exception?: string; }
+export interface GateAppointment { id: string; containerId: string; truckNo: string; driver: string; type: 'pickup' | 'dropoff'; windowStart: string; windowEnd: string; lane: 'north' | 'south' | 'rail'; status: AppointmentStatus; sealVerified: boolean; weightVerified: boolean; checkedInAt?: string; completedAt?: string; cancelledAt?: string; statusBeforeCheckIn?: ContainerStatus; exception?: string; }
 export interface Equipment { id: string; name: string; kind: EquipmentKind; status: 'available' | 'working' | 'maintenance' | 'offline'; location: string; battery: number; queue: number; movesPerHour: number; }
 export interface YardTask { id: string; kind: 'receive' | 'deliver' | 'rehandle' | 'load' | 'discharge' | 'inspect'; containerId: string; from: string; to: string; equipmentId?: string; priority: number; status: TaskStatus; scheduledAt: string; blockingReasons: string[]; estimatedMinutes: number; }
 export interface AuditEvent { id: string; actor: string; action: string; entity: string; entityId: string; at: string; details: string; }
@@ -33,7 +33,7 @@ export const containers: Container[] = [
   { id: 'TEMU-1774029', voyageId: 'VOY-AX7', size: '40', isoType: '45R1', direction: 'import', status: 'in-yard', weightT: 26.3, reefer: true, temperature: 4, customs: 'inspection', priority: 'reefer', yardSlot: 'D05-R05-T1', lastEvent: '待海关查验' }
 ];
 export const appointments: GateAppointment[] = [
-  { id: 'APT-9001', containerId: 'OOLU-7734201', truckNo: '沪A·7K229', driver: '陈海', type: 'dropoff', windowStart: iso(-14), windowEnd: iso(16), lane: 'south', status: 'checked-in', sealVerified: true, weightVerified: true },
+  { id: 'APT-9001', containerId: 'OOLU-7734201', truckNo: '沪A·7K229', driver: '陈海', type: 'dropoff', windowStart: iso(-14), windowEnd: iso(16), lane: 'south', status: 'checked-in', sealVerified: true, weightVerified: true, checkedInAt: iso(-6) },
   { id: 'APT-9002', containerId: 'MSCU-4829017', truckNo: '苏E·66218', driver: '王建国', type: 'pickup', windowStart: iso(34), windowEnd: iso(64), lane: 'north', status: 'booked', sealVerified: false, weightVerified: false },
   { id: 'APT-9003', containerId: 'EISU-1288420', truckNo: '沪B·02891', driver: '赵晨', type: 'pickup', windowStart: iso(38), windowEnd: iso(68), lane: 'north', status: 'booked', sealVerified: false, weightVerified: false },
   { id: 'APT-9004', containerId: 'FCIU-9920310', truckNo: '沪A·7K229', driver: '陈海', type: 'pickup', windowStart: iso(4), windowEnd: iso(22), lane: 'south', status: 'booked', sealVerified: false, weightVerified: false, exception: '同一车辆相邻窗口过短' }
@@ -80,12 +80,192 @@ export function containerPlan(containerId: string) {
   return { container, recommendedBlock: selected, alternatives: ranked.slice(1, 3).map(item => item.block), reasons };
 }
 export function prioritizeTasks() { return tasks.map(task => ({ ...task, score: task.priority + (task.blockingReasons.length ? -20 : 10) + (task.kind === 'inspect' ? 12 : 0) })).sort((a, b) => b.score - a.score); }
-export function createAppointment(input: Omit<GateAppointment, 'id' | 'status' | 'sealVerified' | 'weightVerified'>) {
-  const container = containers.find(item => item.id === input.containerId); if (!container) throw new Error('箱号不存在');
-  if (container.customs !== 'released' && input.type === 'pickup') throw new Error('海关未放行，不能预约提箱');
-  const item: GateAppointment = { ...input, id: `APT-${Date.now()}`, status: 'booked', sealVerified: false, weightVerified: false }; appointments.unshift(item); container.appointmentId = item.id; return item;
+/** 闸口分阶段作业校验失败：携带逐条原因，供值班员定位是海关问题还是证据缺失 */
+export class GateFlowError extends Error {
+  constructor(public reasons: string[]) { super(reasons.join('；')); this.name = 'GateFlowError'; }
 }
-export function updateAppointment(id: string, patch: Partial<Pick<GateAppointment, 'status' | 'sealVerified' | 'weightVerified' | 'exception'>>) { const item = appointments.find(a => a.id === id); if (!item) return undefined; Object.assign(item, patch); const container = containers.find(c => c.id === item.containerId); if (item.status === 'checked-in' && container) container.status = 'at-gate'; if (item.status === 'completed' && container) container.status = item.type === 'pickup' ? 'released' : 'in-yard'; auditEvents.unshift({ id: `AUD-${Date.now()}`, actor: '闸口值班员', action: 'GATE_UPDATE', entity: 'appointment', entityId: id, at: new Date().toISOString(), details: JSON.stringify(patch) }); return item; }
+
+export type GateStage = 'check-in' | 'verify-seal' | 'verify-weight' | 'complete' | 'cancel' | 'reopen';
+export interface GateFlowResult {
+  stage: GateStage;
+  appointment: GateAppointment;
+  container: Container;
+  previousContainerStatus: ContainerStatus;
+  containerStatusChanged: boolean;
+  message: string;
+}
+
+const gateLaneLabel: Record<GateAppointment['lane'], string> = { north: '北闸口', south: '南闸口', rail: '铁路闸口' };
+export const gateTypeLabel = (type: GateAppointment['type']) => type === 'pickup' ? '提箱' : '进场';
+export const customsLabel: Record<Container['customs'], string> = { released: '已放行', inspection: '查验中', hold: '扣留' };
+export const containerStatusLabel: Record<ContainerStatus, string> = {
+  'in-transit': '运输中', 'at-gate': '闸口在场', 'in-yard': '场内堆存', 'on-quay': '码头前沿', released: '已放行提离', hold: '挂起'
+};
+const clock = (value: string) => new Date(value).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+function findAppointment(id: string) {
+  const item = appointments.find(a => a.id === id);
+  if (!item) throw new GateFlowError([`预约 ${id} 不存在，列表可能已被其他值班员刷新，请重新同步后再操作`]);
+  return item;
+}
+
+function statusGuardReasons(appointment: GateAppointment, stage: Exclude<GateStage, 'verify-seal' | 'verify-weight'>): string[] {
+  const { status, id } = appointment;
+  if (stage === 'check-in') {
+    if (status === 'checked-in') return [`车辆已于 ${appointment.checkedInAt ? clock(appointment.checkedInAt) : ''} 在${gateLaneLabel[appointment.lane]}签到，请勿重复签到`];
+    if (status === 'completed') return [`该预约已于 ${appointment.completedAt ? clock(appointment.completedAt) : ''} 完成，不能重复签到；如需重新作业请先恢复预约`];
+    if (status === 'cancelled') return ['预约已取消，请先点击“恢复预约”再安排车辆签到'];
+  }
+  if (stage === 'complete') {
+    if (status === 'booked') return ['车辆尚未签到，必须先完成签到和封志/称重校验才能办结'];
+    if (status === 'completed') return ['该预约已办结，箱务状态已同步，请勿重复点击完成'];
+    if (status === 'cancelled') return ['预约已取消，不能办结；请先恢复预约并重新签到'];
+  }
+  if (stage === 'cancel') {
+    if (status === 'completed') return [`预约 ${id} 已办结离场，不能取消；如需作废请走海关/闸口异常处理流程`];
+    if (status === 'cancelled') return ['预约已是取消状态，无需重复取消，可直接恢复预约'];
+  }
+  if (stage === 'reopen') {
+    if (status === 'booked') return ['预约当前就是待签到状态，可直接签到，无需恢复'];
+    if (status === 'checked-in') return ['车辆已在场内签到，请直接完成封志/称重校验后办结，恢复只用于取消后的预约'];
+    if (status === 'completed') return ['已办结预约不能恢复，请到箱务台账调整箱状态'];
+  }
+  return [];
+}
+
+/** 办结前的放行条件：封志/称重证据 + 海关状态，逐条返回不满足的原因 */
+export function gateCompletionBlockers(appointment: GateAppointment): string[] {
+  const reasons: string[] = [];
+  const container = containers.find(c => c.id === appointment.containerId);
+  if (!container) {
+    reasons.push(`箱号 ${appointment.containerId} 在箱务台账中不存在，无法核对海关与证据条件`);
+    return reasons;
+  }
+  const action = gateTypeLabel(appointment.type);
+  if (!appointment.sealVerified) reasons.push(`封志未核验通过：闸口封志证据缺失，不能完成${action}`);
+  if (!appointment.weightVerified) reasons.push(`称重未核验通过：地磅重量证据缺失，不能完成${action}`);
+  if (container.customs === 'hold') reasons.push(`海关状态为“扣留”，${container.id} 被海关布控，请联系海关解除扣留后再${action}`);
+  if (container.customs === 'inspection') {
+    if (appointment.type === 'pickup') reasons.push(`海关查验尚未结束（状态：查验中），${container.id} 不能提箱离场`);
+    else reasons.push(`海关查验尚未结束（状态：查验中），${container.id} 进场后必须先落位查验区 D05 监管，不能按普通进场办结`);
+  }
+  return reasons;
+}
+
+function evidenceGuardReasons(appointment: GateAppointment): string[] {
+  const { status } = appointment;
+  if (status === 'booked') return ['车辆尚未签到，签到后才能登记封志/称重校验结果'];
+  if (status === 'completed') return ['预约已办结，封志/称重证据已归档，不能再修改'];
+  if (status === 'cancelled') return ['预约已取消，不能登记校验结果；请先恢复预约并重新签到'];
+  return [];
+}
+
+function syncContainer(appointment: GateAppointment, status: ContainerStatus, event: string): Container {
+  const container = containers.find(c => c.id === appointment.containerId);
+  if (!container) throw new GateFlowError([`箱号 ${appointment.containerId} 在箱务台账中不存在，无法同步箱务状态`]);
+  container.status = status;
+  container.lastEvent = `${event} ${new Date().toLocaleString([], { hour: '2-digit', minute: '2-digit' })}`;
+  return container;
+}
+
+function recordGateAudit(action: string, id: string, details: string) {
+  auditEvents.unshift({ id: `AUD-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, actor: '闸口值班员', action, entity: 'appointment', entityId: id, at: new Date().toISOString(), details });
+}
+
+function flowResult(stage: GateStage, appointment: GateAppointment, container: Container, previous: ContainerStatus, message: string): GateFlowResult {
+  return { stage, appointment, container, previousContainerStatus: previous, containerStatusChanged: previous !== container.status, message };
+}
+
+/** 阶段 1：签到。闸口值班员核对箱号与预约类型（提箱/进场）后确认 */
+export function gateCheckIn(id: string): GateFlowResult {
+  const appointment = findAppointment(id);
+  const blockers = statusGuardReasons(appointment, 'check-in');
+  if (blockers.length) throw new GateFlowError(blockers);
+  const container = containers.find(c => c.id === appointment.containerId);
+  if (!container) throw new GateFlowError([`箱号 ${appointment.containerId} 在箱务台账中不存在，不能签到`]);
+  const previous = container.status;
+  appointment.status = 'checked-in';
+  appointment.checkedInAt = new Date().toISOString();
+  appointment.statusBeforeCheckIn = previous;
+  const updated = syncContainer(appointment, 'at-gate', `${gateLaneLabel[appointment.lane]}签到`);
+  recordGateAudit('GATE_CHECK_IN', id, `${container.id} ${gateTypeLabel(appointment.type)}签到，箱务 ${previous} -> at-gate`);
+  return flowResult('check-in', appointment, updated, previous,
+    `${container.id}（${gateTypeLabel(appointment.type)}）已在${gateLaneLabel[appointment.lane]}签到，箱务状态已变为“闸口在场”，请继续完成封志与称重校验`);
+}
+
+/** 阶段 2：封志 / 称重证据登记，可反复纠正，但办结后锁定 */
+export function gateVerify(id: string, field: 'sealVerified' | 'weightVerified', value: boolean): GateFlowResult {
+  const appointment = findAppointment(id);
+  const blockers = evidenceGuardReasons(appointment);
+  if (blockers.length) throw new GateFlowError(blockers);
+  const container = containers.find(c => c.id === appointment.containerId);
+  if (!container) throw new GateFlowError([`箱号 ${appointment.containerId} 在箱务台账中不存在`]);
+  appointment[field] = value;
+  const label = field === 'sealVerified' ? '封志' : '称重';
+  recordGateAudit('GATE_VERIFY', id, `${container.id} ${label}核验登记为 ${value ? '通过' : '不通过/撤销'}`);
+  return flowResult(field === 'sealVerified' ? 'verify-seal' : 'verify-weight', appointment, container, container.status,
+    value ? `${container.id} ${label}核验已通过` : `已撤销 ${container.id} 的${label}核验结果，办结前必须重新核验通过`);
+}
+
+/** 阶段 3：办结提箱/进场。证据齐全且海关放行才允许，同时同步箱务状态 */
+export function gateComplete(id: string): GateFlowResult {
+  const appointment = findAppointment(id);
+  const blockers = [...statusGuardReasons(appointment, 'complete'), ...(appointment.status === 'checked-in' ? gateCompletionBlockers(appointment) : [])];
+  if (blockers.length) throw new GateFlowError(blockers);
+  const container = containers.find(c => c.id === appointment.containerId);
+  if (!container) throw new GateFlowError([`箱号 ${appointment.containerId} 在箱务台账中不存在`]);
+  const previous = container.status;
+  appointment.status = 'completed';
+  appointment.completedAt = new Date().toISOString();
+  const next: ContainerStatus = appointment.type === 'pickup' ? 'released' : 'in-yard';
+  const updated = syncContainer(appointment, next, appointment.type === 'pickup' ? '提箱离场办结' : `进场落位 ${container.yardSlot}`);
+  recordGateAudit('GATE_COMPLETE', id, `${container.id} ${gateTypeLabel(appointment.type)}办结，箱务 ${previous} -> ${next}`);
+  const message = appointment.type === 'pickup'
+    ? `提箱完成：${container.id} 箱务状态已由“${containerStatusLabel[previous]}”变为“已放行提离”，车辆可离场`
+    : `进场完成：${container.id} 箱务状态已由“${containerStatusLabel[previous]}”变为“场内堆存”，堆位 ${container.yardSlot}，已通知场桥作业`;
+  return flowResult('complete', appointment, updated, previous, message);
+}
+
+/** 取消：已签到车辆同步把箱子退回签到前状态，取消后可恢复重新走流程 */
+export function gateCancel(id: string): GateFlowResult {
+  const appointment = findAppointment(id);
+  const blockers = statusGuardReasons(appointment, 'cancel');
+  if (blockers.length) throw new GateFlowError(blockers);
+  const container = containers.find(c => c.id === appointment.containerId);
+  if (!container) throw new GateFlowError([`箱号 ${appointment.containerId} 在箱务台账中不存在`]);
+  const previous = container.status;
+  appointment.status = 'cancelled';
+  appointment.cancelledAt = new Date().toISOString();
+  appointment.sealVerified = false;
+  appointment.weightVerified = false;
+  let updated = container;
+  if (previous === 'at-gate') {
+    const restore: ContainerStatus = appointment.statusBeforeCheckIn ?? (appointment.type === 'pickup' ? 'in-yard' : 'at-gate');
+    updated = syncContainer(appointment, restore, '签到取消，退回签到前状态');
+  }
+  recordGateAudit('GATE_CANCEL', id, `${container.id} 预约取消${previous !== updated.status ? `，箱务 ${previous} -> ${updated.status}` : ''}`);
+  return flowResult('cancel', appointment, updated, previous,
+    `预约 ${appointment.id}（${container.id} ${gateTypeLabel(appointment.type)}）已取消${previous !== updated.status ? `，箱务状态退回“${containerStatusLabel[updated.status]}”` : ''}，可恢复后重新安排`);
+}
+
+/** 恢复：仅针对已取消预约，重置为待签到并清空证据，保证重新签到/校验/办结链路一致 */
+export function gateReopen(id: string): GateFlowResult {
+  const appointment = findAppointment(id);
+  const blockers = statusGuardReasons(appointment, 'reopen');
+  if (blockers.length) throw new GateFlowError(blockers);
+  const container = containers.find(c => c.id === appointment.containerId);
+  if (!container) throw new GateFlowError([`箱号 ${appointment.containerId} 在箱务台账中不存在`]);
+  appointment.status = 'booked';
+  appointment.checkedInAt = undefined;
+  appointment.completedAt = undefined;
+  appointment.cancelledAt = undefined;
+  appointment.sealVerified = false;
+  appointment.weightVerified = false;
+  recordGateAudit('GATE_REOPEN', id, `${container.id} 预约恢复为待签到，证据重置`);
+  return flowResult('reopen', appointment, container, container.status,
+    `预约 ${appointment.id} 已恢复为待签到，封志/称重证据已重置，请重新完成签到`);
+}
+
 export function assignTask(id: string, equipmentId: string) { const task = tasks.find(item => item.id === id); const machine = equipment.find(item => item.id === equipmentId); if (!task || !machine) return undefined; const blockingReasons = [...task.blockingReasons]; if (machine.status === 'maintenance' || machine.status === 'offline') blockingReasons.push(`${machine.name} 当前不可用`); if (task.kind === 'inspect' && machine.kind !== 'reach-stacker') blockingReasons.push('查验作业需要正面吊或专用设备'); task.equipmentId = equipmentId; task.status = blockingReasons.length ? 'blocked' : 'assigned'; task.blockingReasons = blockingReasons; auditEvents.unshift({ id: `AUD-${Date.now()}`, actor: '中控调度员', action: 'ASSIGN_TASK', entity: 'yard-task', entityId: id, at: new Date().toISOString(), details: `${equipmentId} -> ${task.containerId}` }); return task; }
 export function containerDetail(id: string) { const container = containers.find(item => item.id === id); if (!container) return undefined; return { container, voyage: voyages.find(v => v.id === container.voyageId), appointment: appointments.find(a => a.id === container.appointmentId), plan: containerPlan(id), tasks: tasks.filter(t => t.containerId === id) }; }
 
@@ -143,7 +323,7 @@ export function deleteContainer(id: string) {
 export function createGateAppointment(input: AppointmentInput) {
   const container = containers.find(item => item.id === input.containerId);
   if (!container) throw new Error('箱号不存在');
-  if (input.type === 'pickup' && container.customs !== 'released') throw new Error('海关未放行，不能预约提箱');
+  if (input.type === 'pickup' && container.customs !== 'released') throw new GateFlowError([`海关状态为“${customsLabel[container.customs]}”，${container.id} 不能预约提箱，请先完成海关放行`]);
   if (new Date(input.windowEnd) <= new Date(input.windowStart)) throw new Error('预约结束时间必须晚于开始时间');
   const item: GateAppointment = { ...input, id: `APT-${Date.now()}`, status: 'booked', sealVerified: false, weightVerified: false };
   appointments.unshift(item);
@@ -152,19 +332,26 @@ export function createGateAppointment(input: AppointmentInput) {
   return item;
 }
 
-export function editGateAppointment(id: string, patch: Partial<AppointmentInput & Pick<GateAppointment, 'status' | 'sealVerified' | 'weightVerified' | 'exception'>>) {
+export function editGateAppointment(id: string, patch: Partial<AppointmentInput>) {
   const item = appointments.find(appointment => appointment.id === id);
   if (!item) return undefined;
+  const flowKeys = ['status', 'sealVerified', 'weightVerified', 'checkedInAt', 'completedAt', 'cancelledAt'] as const;
+  const tampered = flowKeys.filter(key => (patch as Record<string, unknown>)[key] !== undefined);
+  if (tampered.length) throw new GateFlowError([`签到、封志/称重、完成、取消等状态只能通过闸口分阶段操作变更，编辑预约不能修改：${tampered.join('、')}`]);
+  if (item.status === 'completed') throw new GateFlowError(['预约已办结，箱务状态已归档，不能再编辑时隙；如需调整请新建预约']);
+  if (item.status === 'checked-in') throw new GateFlowError(['车辆已签到，正在闸口作业，不能直接编辑；如需改约请先取消当前签到']);
   if (patch.containerId && !containers.some(container => container.id === patch.containerId)) throw new Error('箱号不存在');
+  if (patch.type && patch.type === 'pickup') {
+    const target = containers.find(container => container.id === (patch.containerId ?? item.containerId));
+    if (target && target.customs !== 'released') throw new GateFlowError([`海关状态为“${customsLabel[target.customs]}”，${target.id} 不能预约提箱，请先完成海关放行`]);
+  }
   if (patch.windowStart && patch.windowEnd && new Date(patch.windowEnd) <= new Date(patch.windowStart)) throw new Error('预约结束时间必须晚于开始时间');
   const previousContainer = containers.find(container => container.id === item.containerId);
   Object.assign(item, patch);
   const nextContainer = containers.find(container => container.id === item.containerId);
   if (previousContainer && previousContainer.id !== nextContainer?.id && previousContainer.appointmentId === id) previousContainer.appointmentId = undefined;
   if (nextContainer) nextContainer.appointmentId = id;
-  if (item.status === 'checked-in' && nextContainer) nextContainer.status = 'at-gate';
-  if (item.status === 'completed' && nextContainer) nextContainer.status = item.type === 'pickup' ? 'released' : 'in-yard';
-  recordAudit('UPDATE', 'appointment', id, `更新预约状态/时隙：${JSON.stringify(patch)}`);
+  recordAudit('UPDATE', 'appointment', id, `更新预约时隙/车辆信息：${JSON.stringify(patch)}`);
   return item;
 }
 
