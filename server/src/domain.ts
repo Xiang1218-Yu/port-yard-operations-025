@@ -178,6 +178,56 @@ export function deleteGateAppointment(id: string) {
   return item;
 }
 
+const gateTypeLabel = (item: GateAppointment) => (item.type === 'pickup' ? '提箱' : '进场');
+
+export function checkInAppointment(id: string) {
+  const item = appointments.find(appointment => appointment.id === id);
+  if (!item) return undefined;
+  if (item.status === 'checked-in') throw new Error(`预约 ${id} 已签到，请勿重复操作`);
+  if (item.status === 'completed') throw new Error(`预约 ${id} 已完成，无法再次签到`);
+  if (item.status !== 'booked') throw new Error(`预约当前状态为 ${item.status}，不能签到`);
+  item.status = 'checked-in';
+  const container = containers.find(entry => entry.id === item.containerId);
+  if (container) {
+    container.status = 'at-gate';
+    container.lastEvent = `闸口签到 ${new Date().toLocaleString()}`;
+  }
+  recordAudit('CHECK_IN', 'appointment', id, `${gateTypeLabel(item)}签到，箱号 ${item.containerId}，车道 ${item.lane}`);
+  return { appointment: item, container };
+}
+
+export function verifyAppointment(id: string, patch: Partial<Pick<GateAppointment, 'sealVerified' | 'weightVerified'>>) {
+  const item = appointments.find(appointment => appointment.id === id);
+  if (!item) return undefined;
+  if (item.status === 'booked') throw new Error('预约尚未签到，请先签到再录入封志/称重校验');
+  if (item.status !== 'checked-in') throw new Error(`预约当前状态为 ${item.status}，不能录入校验结果`);
+  if (patch.sealVerified !== undefined) item.sealVerified = patch.sealVerified;
+  if (patch.weightVerified !== undefined) item.weightVerified = patch.weightVerified;
+  recordAudit('VERIFY', 'appointment', id, `封志校验=${item.sealVerified ? '通过' : '未通过'}，称重校验=${item.weightVerified ? '通过' : '未通过'}`);
+  return { appointment: item, container: containers.find(entry => entry.id === item.containerId) };
+}
+
+export function completeAppointment(id: string) {
+  const item = appointments.find(appointment => appointment.id === id);
+  if (!item) return undefined;
+  if (item.status === 'completed') throw new Error(`预约 ${id} 已完成，请勿重复操作`);
+  if (item.status === 'booked') throw new Error('预约尚未签到，不能完成闸口作业');
+  if (item.status !== 'checked-in') throw new Error(`预约当前状态为 ${item.status}，不能完成`);
+  const container = containers.find(entry => entry.id === item.containerId);
+  const reasons: string[] = [];
+  if (!item.sealVerified) reasons.push('封志校验未通过');
+  if (!item.weightVerified) reasons.push('称重校验未通过');
+  if (item.type === 'pickup' && container && container.customs !== 'released') reasons.push(`海关状态为${container.customs === 'inspection' ? '查验中' : '扣留'}，未放行`);
+  if (reasons.length) throw new Error(`无法完成${gateTypeLabel(item)}：${reasons.join('；')}`);
+  item.status = 'completed';
+  if (container) {
+    container.status = item.type === 'pickup' ? 'released' : 'in-yard';
+    container.lastEvent = `${item.type === 'pickup' ? '提箱出场' : '进场落箱'} ${new Date().toLocaleString()}`;
+  }
+  recordAudit('COMPLETE', 'appointment', id, `${gateTypeLabel(item)}完成，箱 ${item.containerId} 状态更新为 ${container?.status ?? '未知'}`);
+  return { appointment: item, container };
+}
+
 export function createYardTask(input: TaskInput) {
   if (!containers.some(container => container.id === input.containerId)) throw new Error('关联箱号不存在');
   if (input.priority < 1 || input.priority > 100) throw new Error('优先级范围为 1–100');

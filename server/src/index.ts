@@ -1,5 +1,5 @@
 import express from 'express';
-import { appointments, assignTask, blocks, containerDetail, containers, createContainer, createGateAppointment, createYardTask, dashboard, deleteContainer, deleteGateAppointment, deleteYardTask, editGateAppointment, equipment, gateConflicts, prioritizeTasks, tasks, updateContainer, updateYardTask, voyages, yardHeatmap } from './domain.js';
+import { appointments, assignTask, blocks, checkInAppointment, completeAppointment, containerDetail, containers, createContainer, createGateAppointment, createYardTask, dashboard, deleteContainer, deleteGateAppointment, deleteYardTask, editGateAppointment, equipment, gateConflicts, prioritizeTasks, tasks, updateContainer, updateYardTask, verifyAppointment, voyages, yardHeatmap } from './domain.js';
 const app = express(); app.use(express.json());
 app.get('/api/dashboard', (_req, res) => res.json(dashboard()));
 app.get('/api/voyages', (_req, res) => res.json(voyages));
@@ -14,6 +14,9 @@ app.get('/api/gate/appointments', (_req, res) => res.json(appointments));
 app.get('/api/gate/conflicts', (_req, res) => res.json(gateConflicts()));
 app.post('/api/gate/appointments', (req, res) => { try { res.status(201).json(createGateAppointment(req.body)); } catch (error) { res.status(409).json({ message: error instanceof Error ? error.message : '预约失败' }); } });
 app.patch('/api/gate/appointments/:id', (req, res) => { try { const result = editGateAppointment(req.params.id, req.body); if (!result) return res.status(404).json({ message: '预约不存在' }); res.json(result); } catch (error) { res.status(409).json({ message: error instanceof Error ? error.message : '更新预约失败' }); } });
+app.post('/api/gate/appointments/:id/check-in', (req, res) => { try { const result = checkInAppointment(req.params.id); if (!result) return res.status(404).json({ message: '预约不存在' }); res.json(result); } catch (error) { res.status(409).json({ message: error instanceof Error ? error.message : '签到失败' }); } });
+app.post('/api/gate/appointments/:id/verify', (req, res) => { try { const result = verifyAppointment(req.params.id, req.body ?? {}); if (!result) return res.status(404).json({ message: '预约不存在' }); res.json(result); } catch (error) { res.status(409).json({ message: error instanceof Error ? error.message : '校验失败' }); } });
+app.post('/api/gate/appointments/:id/complete', (req, res) => { try { const result = completeAppointment(req.params.id); if (!result) return res.status(404).json({ message: '预约不存在' }); res.json(result); } catch (error) { res.status(409).json({ message: error instanceof Error ? error.message : '完成失败' }); } });
 app.delete('/api/gate/appointments/:id', (req, res) => { const result = deleteGateAppointment(req.params.id); if (!result) return res.status(404).json({ message: '预约不存在' }); res.json({ deleted: true, id: result.id }); });
 app.get('/api/equipment', (_req, res) => res.json(equipment));
 app.get('/api/tasks', (_req, res) => res.json(prioritizeTasks()));
